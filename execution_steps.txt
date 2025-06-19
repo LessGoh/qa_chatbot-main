@@ -1,0 +1,8 @@
+Step 1:
+docker build -t all .
+
+Step 2:
+docker run -dp 127.0.0.1:8501:8501 -p 8000:8000 all
+
+Step 3:
+Open "127.0.0.1:8501" on browser

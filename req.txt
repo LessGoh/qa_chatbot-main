@@ -1,0 +1,13 @@
+pinecone[grpc]
+langchain-pinecone
+langchain-openai
+langchain-text-splitters
+langchain
+fastapi 
+uvicorn 
+requests 
+langchain_community
+pydantic
+streamlit
+python-multipart
+pypdf
