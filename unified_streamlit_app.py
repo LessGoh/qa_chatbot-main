@@ -1,211 +1,292 @@
 import streamlit as st
 import os
 import tempfile
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.runnables import RunnablePassthrough
+import time
+from typing import List
+
+try:
+    from langchain.document_loaders import PyPDFLoader
+except ImportError:
+    try:
+        from langchain_community.document_loaders import PyPDFLoader
+    except ImportError:
+        # Fallback to pypdf direct usage
+        import pypdf
+        from langchain.schema import Document
+        
+        class PyPDFLoader:
+            def __init__(self, file_path):
+                self.file_path = file_path
+            
+            def load_and_split(self):
+                documents = []
+                with open(self.file_path, 'rb') as file:
+                    pdf_reader = pypdf.PdfReader(file)
+                    for page_num, page in enumerate(pdf_reader.pages):
+                        text = page.extract_text()
+                        if text.strip():
+                            doc = Document(
+                                page_content=text,
+                                metadata={"source": self.file_path, "page": page_num}
+                            )
+                            documents.append(doc)
+                return documents
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema.runnable import RunnablePassthrough
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
-from pinecone.grpc import PineconeGRPC as Pinecone
-from pinecone import ServerlessSpec
-import time
-from langchain_pinecone import PineconeVectorStore
+from langchain.vectorstores import Pinecone as LangchainPinecone
+import pinecone
 
-# Инициализация состояния
+# Инициализация состояния сессии
 if 'vectorstore' not in st.session_state:
     st.session_state.vectorstore = None
 if 'documents_processed' not in st.session_state:
     st.session_state.documents_processed = False
+if 'pinecone_initialized' not in st.session_state:
+    st.session_state.pinecone_initialized = False
 
 def format_docs(docs):
+    """Форматирование документов для RAG"""
     return "\n\n".join(doc.page_content for doc in docs)
 
-def setup_pinecone():
-    """Настройка Pinecone векторной базы данных"""
+def initialize_pinecone(api_key: str):
+    """Инициализация Pinecone"""
     try:
-        pc = Pinecone()
-        spec = ServerlessSpec(cloud='aws', region='us-east-1')
+        pinecone.init(
+            api_key=api_key,
+            environment="us-east-1-aws"  # Измените на ваш регион
+        )
         
-        # Создание индекса
         index_name = "streamlit-qa-bot"
-        existing_indexes = [item['name'] for item in pc.list_indexes().indexes]
         
-        if index_name in existing_indexes:
-            pc.delete_index(index_name)
-            st.info("Удаляем старый индекс...")
-        
-        pc.create_index(
-            index_name,
-            dimension=1536,  # dimensionality of text-embedding-ada-002
-            metric='cosine',
-            spec=spec
-        )
-        
-        # Ожидание готовности индекса
-        while not pc.describe_index(index_name).status['ready']:
-            time.sleep(1)
-        
-        index = pc.Index(index_name)
-        embeddings = OpenAIEmbeddings()
-        
-        vectorstore = PineconeVectorStore(index, embeddings, "text")
-        return vectorstore
-    
-    except Exception as e:
-        st.error(f"Ошибка настройки Pinecone: {str(e)}")
-        return None
-
-def process_pdf(uploaded_file):
-    """Обработка загруженного PDF файла"""
-    try:
-        # Сохранение временного файла
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_file_path = tmp_file.name
-        
-        # Загрузка и обработка PDF
-        pdf_loader = PyPDFLoader(tmp_file_path)
-        pages = pdf_loader.load_and_split()
-        
-        # Разделение на чанки
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000, 
-            chunk_overlap=100
-        )
-        splits = text_splitter.split_documents(pages)
-        
-        # Добавление документов в векторное хранилище
-        if st.session_state.vectorstore:
-            st.session_state.vectorstore.add_documents(documents=splits)
+        # Проверяем существование индекса
+        if index_name not in pinecone.list_indexes():
+            # Создаем новый индекс
+            pinecone.create_index(
+                name=index_name,
+                dimension=1536,  # Размерность для text-embedding-ada-002
+                metric="cosine"
+            )
             
-        # Удаление временного файла
-        os.unlink(tmp_file_path)
+            # Ждем готовности индекса
+            while index_name not in pinecone.list_indexes():
+                time.sleep(1)
         
-        return True, len(splits)
+        return True, index_name
     
     except Exception as e:
         return False, str(e)
 
-def ask_question(question):
+def setup_vectorstore(api_key: str):
+    """Настройка векторного хранилища"""
+    try:
+        success, result = initialize_pinecone(api_key)
+        if not success:
+            return False, f"Ошибка инициализации Pinecone: {result}"
+        
+        index_name = result
+        embeddings = OpenAIEmbeddings()
+        
+        # Создаем векторное хранилище
+        vectorstore = LangchainPinecone.from_existing_index(
+            index_name=index_name,
+            embedding=embeddings
+        )
+        
+        return True, vectorstore
+    
+    except Exception as e:
+        return False, str(e)
+
+def process_pdf_file(uploaded_file):
+    """Обработка загруженного PDF файла"""
+    try:
+        # Создаем временный файл
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_file_path = tmp_file.name
+        
+        # Загружаем PDF
+        loader = PyPDFLoader(tmp_file_path)
+        documents = loader.load_and_split()
+        
+        # Разделяем на чанки
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+        )
+        
+        texts = text_splitter.split_documents(documents)
+        
+        # Добавляем в векторное хранилище
+        if st.session_state.vectorstore:
+            st.session_state.vectorstore.add_documents(texts)
+        
+        # Удаляем временный файл
+        os.unlink(tmp_file_path)
+        
+        return True, len(texts)
+    
+    except Exception as e:
+        return False, str(e)
+
+def get_answer(question: str):
     """Получение ответа на вопрос"""
     try:
         if not st.session_state.vectorstore:
-            return "Векторная база данных не настроена"
+            return "Векторное хранилище не настроено"
         
-        retriever = st.session_state.vectorstore.as_retriever()
-        
-        prompt_rag = PromptTemplate.from_template(
-            "Ответь на вопрос: {question} основываясь на контексте: {context}. "
-            "Укажи источники информации из метаданных."
+        # Создаем retriever
+        retriever = st.session_state.vectorstore.as_retriever(
+            search_kwargs={"k": 3}
         )
         
-        llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
+        # Создаем промпт
+        template = """Используй следующий контекст для ответа на вопрос.
+        Если ты не знаешь ответ, скажи что не знаешь, не придумывай ответ.
+
+        {context}
+
+        Вопрос: {question}
+        Ответ:"""
         
+        prompt = PromptTemplate.from_template(template)
+        
+        # Создаем LLM
+        llm = ChatOpenAI(
+            model_name="gpt-3.5-turbo",
+            temperature=0
+        )
+        
+        # Создаем цепочку RAG
         rag_chain = (
             {"context": retriever | format_docs, "question": RunnablePassthrough()}
-            | prompt_rag
+            | prompt
             | llm
         )
         
+        # Получаем ответ
         result = rag_chain.invoke(question)
         return result.content
     
     except Exception as e:
-        return f"Ошибка при обработке вопроса: {str(e)}"
+        return f"Ошибка при получении ответа: {str(e)}"
 
-# Интерфейс Streamlit
+# Основной интерфейс Streamlit
+st.set_page_config(
+    page_title="Document QA System",
+    page_icon="📄",
+    layout="wide"
+)
+
 st.title("📄 Document Question Answering System")
+st.markdown("---")
 
-# Боковая панель с настройками
-st.sidebar.header("⚙️ Настройки")
-
-# Ввод API ключей
-openai_key = st.sidebar.text_input(
-    "🔑 OpenAI API Key", 
-    type="password",
-    help="Введите ваш OpenAI API ключ"
-)
-
-pinecone_key = st.sidebar.text_input(
-    "🌲 Pinecone API Key", 
-    type="password",
-    help="Введите ваш Pinecone API ключ"
-)
-
-# Установка API ключей
-if st.sidebar.button("💾 Сохранить API ключи"):
-    if openai_key and pinecone_key:
-        os.environ["OPENAI_API_KEY"] = openai_key
-        os.environ["PINECONE_API_KEY"] = pinecone_key
-        
-        with st.spinner("Настройка векторной базы данных..."):
-            st.session_state.vectorstore = setup_pinecone()
-        
-        if st.session_state.vectorstore:
-            st.sidebar.success("✅ API ключи сохранены и Pinecone настроен!")
-        else:
-            st.sidebar.error("❌ Ошибка настройки Pinecone")
-    else:
-        st.sidebar.error("❌ Пожалуйста, введите оба API ключа")
-
-# Основной интерфейс
-if openai_key and pinecone_key and st.session_state.vectorstore:
+# Боковая панель для настроек
+with st.sidebar:
+    st.header("⚙️ Настройки")
     
-    # Загрузка файла
-    st.header("📎 Загрузка документа")
-    uploaded_file = st.file_uploader(
-        "Выберите PDF файл", 
-        type="pdf",
-        help="Загрузите PDF документ для анализа"
+    # OpenAI API Key
+    openai_key = st.text_input(
+        "🔑 OpenAI API Key",
+        type="password",
+        help="Введите ваш OpenAI API ключ"
     )
     
-    if uploaded_file and st.button("🚀 Обработать документ"):
-        with st.spinner("Обработка PDF документа..."):
-            success, result = process_pdf(uploaded_file)
-        
-        if success:
-            st.success(f"✅ Документ успешно обработан! Создано {result} фрагментов текста.")
-            st.session_state.documents_processed = True
-        else:
-            st.error(f"❌ Ошибка обработки документа: {result}")
+    # Pinecone API Key
+    pinecone_key = st.text_input(
+        "🌲 Pinecone API Key",
+        type="password",
+        help="Введите ваш Pinecone API ключ"
+    )
     
-    # Секция вопросов
-    if st.session_state.documents_processed:
-        st.header("❓ Задайте вопрос")
-        
-        question = st.text_input(
-            "Введите ваш вопрос о документе:",
-            placeholder="Например: О чем этот документ?"
+    # Кнопка инициализации
+    if st.button("🚀 Инициализировать систему"):
+        if not openai_key:
+            st.error("Введите OpenAI API ключ")
+        elif not pinecone_key:
+            st.error("Введите Pinecone API ключ")
+        else:
+            # Устанавливаем переменные окружения
+            os.environ["OPENAI_API_KEY"] = openai_key
+            
+            with st.spinner("Настройка системы..."):
+                success, result = setup_vectorstore(pinecone_key)
+                
+                if success:
+                    st.session_state.vectorstore = result
+                    st.session_state.pinecone_initialized = True
+                    st.success("✅ Система инициализирована!")
+                else:
+                    st.error(f"❌ Ошибка: {result}")
+
+# Основной контент
+if st.session_state.pinecone_initialized:
+    
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.header("📎 Загрузка документа")
+        uploaded_file = st.file_uploader(
+            "Выберите PDF файл",
+            type="pdf",
+            help="Загрузите PDF документ для анализа"
         )
         
-        if st.button("🔍 Получить ответ") and question:
-            with st.spinner("Поиск ответа..."):
-                answer = ask_question(question)
+        if uploaded_file and st.button("📄 Обработать документ"):
+            with st.spinner("Обработка документа..."):
+                success, result = process_pdf_file(uploaded_file)
             
-            st.subheader("💬 Ответ:")
-            st.write(answer)
+            if success:
+                st.success(f"✅ Документ обработан! Создано {result} фрагментов.")
+                st.session_state.documents_processed = True
+            else:
+                st.error(f"❌ Ошибка: {result}")
     
-    else:
-        st.info("👆 Загрузите и обработайте PDF документ, чтобы начать задавать вопросы.")
+    with col2:
+        st.header("❓ Вопросы и ответы")
+        
+        if st.session_state.documents_processed:
+            question = st.text_area(
+                "Задайте вопрос о документе:",
+                height=100,
+                placeholder="Например: О чем этот документ?"
+            )
+            
+            if st.button("🔍 Получить ответ") and question:
+                with st.spinner("Поиск ответа..."):
+                    answer = get_answer(question)
+                
+                st.subheader("💬 Ответ:")
+                st.write(answer)
+        else:
+            st.info("👈 Сначала загрузите и обработайте PDF документ")
 
 else:
-    st.warning("🔐 Пожалуйста, введите API ключи в боковой панели для начала работы.")
+    st.warning("🔐 Пожалуйста, введите API ключи и инициализируйте систему в боковой панели")
     
-    # Инструкции
-    with st.expander("📋 Инструкции по использованию"):
+    with st.expander("📋 Инструкции"):
         st.markdown("""
-        1. **Получите API ключи:**
-           - OpenAI: https://platform.openai.com/api-keys
-           - Pinecone: https://app.pinecone.io/
+        ### Как получить API ключи:
         
-        2. **Введите ключи** в боковой панели и нажмите "Сохранить"
+        1. **OpenAI API Key:**
+           - Зайдите на https://platform.openai.com/api-keys
+           - Создайте новый API ключ
+           
+        2. **Pinecone API Key:**
+           - Зайдите на https://app.pinecone.io/
+           - В настройках найдите API ключ
         
-        3. **Загрузите PDF документ** и нажмите "Обработать"
-        
-        4. **Задавайте вопросы** о содержании документа
+        ### Как использовать:
+        1. Введите оба API ключа в боковой панели
+        2. Нажмите "Инициализировать систему"
+        3. Загрузите PDF документ
+        4. Задавайте вопросы о содержании
         """)
 
-# Информация о приложении
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🤖 О приложении")
-st.sidebar.markdown("RAG-система для анализа PDF документов с использованием OpenAI и Pinecone.")
+# Футер
+st.markdown("---")
+st.markdown("Built with ❤️ using Streamlit, LangChain, OpenAI, and Pinecone")
